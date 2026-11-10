@@ -161,24 +161,48 @@ struct SyntheticCQ {
     std::vector<__fp16> norms_il;
 
     void make_interleaved() {
-        if (bits != 4 || (N % 4) != 0) return;
-        const uint32_t pgb = cactus_quant_packed_group_bytes(4, group_size);
+        if ((bits != 2 && bits != 3 && bits != 4) || N % 4 != 0) return;
+        const uint32_t pgb = cactus_quant_packed_group_bytes(bits, group_size);
         const size_t NB = N / 4;
         packed_il.assign(NB * num_groups * 4 * (size_t)pgb, 0);
         norms_il.resize(NB * num_groups * 4);
         for (size_t nb = 0; nb < NB; ++nb)
             for (uint32_t g = 0; g < num_groups; ++g) {
                 uint8_t* panel = packed_il.data() + (nb * num_groups + g) * 4 * (size_t)pgb;
+
+                if (bits == 3) {
+                    const uint8_t* rows[4];
+                    for (uint32_t r = 0; r < 4; ++r) {
+                        const size_t n = nb * 4 + r;
+                        rows[r] = packed.data() + (n * num_groups + g) * pgb;
+                        norms_il[(nb * num_groups + g) * 4 + r] = norms[n * num_groups + g];
+                    }
+                    for (uint32_t c = 0; c < group_size / 4; ++c) {
+                        uint64_t word = 0;
+                        for (uint32_t r = 0; r < 4; ++r)
+                            for (uint32_t e = 0; e < 4; ++e)
+                                word |= (uint64_t)unpack_index(rows[r], bits, 4 * c + e) << (12 * r + 3 * e);
+                        for (uint32_t b = 0; b < 6; ++b)
+                            panel[6 * c + b] = (uint8_t)((word >> (8 * b)) & 0xFF);
+                    }
+                    continue;
+                }
                 for (uint32_t r = 0; r < 4; ++r) {
                     const size_t n = nb * 4 + r;
                     const uint8_t* row = packed.data() + (n * num_groups + g) * pgb;
                     for (uint32_t v = 0; v < group_size / 16; ++v)
                         for (uint32_t b = 0; b < 4; ++b) {
-                            auto idx = [&](uint32_t k) { return unpack_index(row, 4, k); };
-                            panel[(2 * v) * 16 + r * 4 + b] =
-                                (uint8_t)(idx(16 * v + b) | (idx(16 * v + 4 + b) << 4));
-                            panel[(2 * v + 1) * 16 + r * 4 + b] =
-                                (uint8_t)(idx(16 * v + 8 + b) | (idx(16 * v + 12 + b) << 4));
+                            auto idx = [&](uint32_t k) { return unpack_index(row, bits, k); };
+                            if (bits == 4) {
+                                panel[(2 * v) * (1 << 4) + r * 4 + b] =
+                                    (uint8_t)(idx((1 << 4) * v + b) | (idx((1 << 4) * v + 4 + b) << 4));
+                                panel[(2 * v + 1) * (1 << 4) + r * 4 + b] =
+                                    (uint8_t)(idx((1 << 4) * v + 8 + b) | (idx((1 << 4) * v + 12 + b) << 4));
+                            } else if (bits == 2) {
+                                panel[(v) * (1 << 4) + 4 * b + r] =
+                                    (uint8_t)(idx((1 << 4) * v + 4 * b) | (idx((1 << 4) * v + 4 * b + 1) << 2) |
+                                    (idx((1 << 4) * v + 4 * b + 2) << 4) | (idx((1 << 4) * v + 4 * b + 3) << 6));
+                            }
                         }
                     norms_il[(nb * num_groups + g) * 4 + r] = norms[n * num_groups + g];
                 }
@@ -576,6 +600,44 @@ static bool test_cq4_interleaved(double& mse_out,
     return mse_out <= 0.1;
 }
 
+static bool test_cq3_interleaved(double& mse_out,
+                                 uint32_t K = 1024, uint32_t N = 192, uint32_t gs = 128) {
+    SyntheticCQ cq(3, K, N, gs, 777);
+    CactusQuantMatrix mat = cq.matrix_interleaved();
+
+    std::mt19937 gen(31);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    std::vector<float> x_f32(K);
+    for (auto& v : x_f32) v = dist(gen);
+    std::vector<float> ref(N, 0.f);
+    cq_reference_gemv_f32(cq, x_f32.data(), ref.data());
+
+    std::vector<__fp16> x_f16(K), y(N, (__fp16)0);
+    for (size_t i = 0; i < K; i++) x_f16[i] = (__fp16)x_f32[i];
+    cactus_quant_matmul(&mat, x_f16.data(), 1, y.data());
+    mse_out = compute_mse(ref.data(), y.data(), N);
+    return mse_out <= 1e-4;
+}
+
+static bool test_cq2_interleaved(double& mse_out,
+                                 uint32_t K = 1024, uint32_t N = 192, uint32_t gs = 128) {
+    SyntheticCQ cq(2, K, N, gs, 777);
+    CactusQuantMatrix mat = cq.matrix_interleaved();
+
+    std::mt19937 gen(31);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    std::vector<float> x_f32(K);
+    for (auto& v : x_f32) v = dist(gen);
+    std::vector<float> ref(N, 0.f);
+    cq_reference_gemv_f32(cq, x_f32.data(), ref.data());
+
+    std::vector<__fp16> x_f16(K), y(N, (__fp16)0);
+    for (size_t i = 0; i < K; i++) x_f16[i] = (__fp16)x_f32[i];
+    cactus_quant_matmul(&mat, x_f16.data(), 1, y.data());
+    mse_out = compute_mse(ref.data(), y.data(), N);
+    return mse_out <= 1e-4;
+}
+
 static bool test_cq4_shared_transform_multi_projection() {
     constexpr uint32_t K = 256;
     SyntheticCQ q(4, K, 128, 128, 901);
@@ -687,9 +749,13 @@ int main() {
     {
         double m1 = 0;
         runner.run_test("matmul_cq4_il", test_cq4_interleaved(m1));
+        runner.run_test("matmul_cq3_il", test_cq3_interleaved(m1));
+        runner.run_test("matmul_cq2_il", test_cq2_interleaved(m1));
         // N=4164 -> 66 chunks incl. a 1-block tail: exercises the multi-thread fused driver.
         double m_mt = 0;
         runner.run_test("matmul_cq4_il_mt", test_cq4_interleaved(m_mt, 1024, 4164, 128));
+        runner.run_test("matmul_cq3_il_mt", test_cq3_interleaved(m_mt, 1024, 4164, 128));
+        runner.run_test("matmul_cq2_il_mt", test_cq2_interleaved(m_mt, 1024, 4164, 128));
         runner.run_test("matmul_cq4_shared_transform", test_cq4_shared_transform_multi_projection());
         runner.run_test("matmul_cq4_metal_distinct_recip", test_cq4_metal_transform_batch_distinct_recip());
     }
