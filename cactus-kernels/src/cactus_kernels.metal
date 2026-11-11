@@ -702,6 +702,101 @@ kernel void cq4_gemm_mma(
     }
 }
 
+kernel void cq_gemm_mma_lowbit(
+    device const half*  code     [[buffer(0)]],
+    device const uchar* packed   [[buffer(1)]],
+    device const half*  codebook [[buffer(2)]],
+    device const half*  norms    [[buffer(3)]],
+    device       half*  y        [[buffer(4)]],
+    constant uint& gs            [[buffer(5)]],
+    constant uint& num_groups    [[buffer(6)]],
+    constant uint& pgb           [[buffer(7)]],
+    constant uint& N             [[buffer(8)]],
+    constant uint& M             [[buffer(9)]],
+    constant uint& bits          [[buffer(10)]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint  tl  [[thread_index_in_threadgroup]],
+    uint  sg  [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float pool[2048];
+    threadgroup float cb[8];
+    threadgroup half* sa = (threadgroup half*)pool;
+    threadgroup half* sb = sa + 2048u;
+    threadgroup float* Cs = pool;
+    if (tl< (1u << bits)) cb[tl]=(float)codebook[tl];
+    const uint NK=32u, NL0=2u, NL1=4u;
+    uint K = num_groups*gs;
+    uint r0 = tg.y*64u;
+    uint r1 = tg.x*32u;
+    uint lr0 = tl/NL0, lr1 = tl/NL1, il0 = tl%NL0;
+    uint nrow = r0+lr0;
+    uint iy = 8u*(tl%NL1);
+    device const half* yrow = code + (size_t)(r1+lr1)*K;
+    simdgroup_matrix<half,8,8> ma[4], mb[2];
+    simdgroup_matrix<float,8,8> mc[8];
+    for (uint i=0;i<8u;i++) mc[i]=make_filled_simdgroup_matrix<float,8,8>(0.f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint loop_k=0; loop_k<K; loop_k+=NK){
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint g=loop_k/gs, e0=loop_k-g*gs;
+        float nrm=(nrow<N)?(float)norms[(((size_t)(nrow>>2)*num_groups+g)<<2) + (nrow&3u)]:0.f;
+        float wv[16];
+        if (nrow<N) {
+            uint rr = nrow & 3u;
+            uint byte_off = ((e0 + 16u*il0) * bits) >> 3;
+            device const uchar* pan = packed + ((size_t)(nrow>>2)*num_groups + g) * 4u * pgb + byte_off * 4u;
+            if (bits == 3) {
+                ulong v = 0;
+                for (uint q=0;q<4u;q++){
+                    device const uchar* ch = pan + q*6u;
+                    ulong word = (ulong)ch[0] | ((ulong)ch[1]<<8) | ((ulong)ch[2]<<16)
+                                | ((ulong)ch[3]<<24) | ((ulong)ch[4]<<32) | ((ulong)ch[5]<<40);
+                    v |= ((word >> (rr*12u)) & 0xFFFul) << (12u*q);
+                }
+
+                wv[0]=cb[v&7u]; wv[1]=cb[(v>>3)&7u];  wv[2]=cb[(v>>6)&7u];  wv[3]=cb[(v>>9)&7u];
+                wv[4]=cb[(v>>12)&7u]; wv[5]=cb[(v>>15)&7u]; wv[6]=cb[(v>>18)&7u]; wv[7]=cb[(v>>21)&7u];
+                wv[8]=cb[(v>>24)&7u]; wv[9]=cb[(v>>27)&7u]; wv[10]=cb[(v>>30)&7u]; wv[11]=cb[(v>>33)&7u];
+                wv[12]=cb[(v>>36)&7u]; wv[13]=cb[(v>>39)&7u]; wv[14]=cb[(v>>42)&7u]; wv[15]=cb[(v>>45)&7u];
+            } else {
+                uint w = ((uint) pan[rr]) | ((uint) pan[rr+4u]<<8) | ((uint) pan[rr+8u]<<16) | ((uint) pan[rr+12u]<<24);
+                wv[0]=cb[w&3u]; wv[1]=cb[(w>>2u)&3u]; wv[2]=cb[(w>>4u)&3u]; wv[3]=cb[(w>>6u)&3u];
+                wv[4]=cb[(w>>8u)&3u]; wv[5]=cb[(w>>10u)&3u]; wv[6]=cb[(w>>12u)&3u]; wv[7]=cb[(w>>14u)&3u];
+                wv[8]=cb[(w>>16u)&3u]; wv[9]=cb[(w>>18u)&3u]; wv[10]=cb[(w>>20u)&3u]; wv[11]=cb[(w>>22u)&3u];
+                wv[12]=cb[(w>>24u)&3u]; wv[13]=cb[(w>>26u)&3u]; wv[14]=cb[(w>>28u)&3u]; wv[15]=cb[(w>>30u)&3u];
+            }
+        }
+        for (uint i=0;i<16u;i++){
+            uint sx=2u*il0+i/8u, sy=(tl/NL0)/8u, lx=(tl/NL0)%8u, ly=i%8u, ib=8u*sx+sy;
+            float v=0.f;
+            if (loop_k+16u*il0+i<K && nrow<N) v=nrm*wv[i];
+            sa[64u*ib+8u*ly+lx]=(half)v;
+        }
+        for (uint i=0;i<8u;i++){
+            uint sx=tl%NL1, sy=(tl/NL1)/8u, lx=i, ly=(tl/NL1)%8u, ib=4u*sx+sy;
+            sb[64u*ib+8u*ly+lx]=(loop_k+iy+i<K && r1+lr1<M)?yrow[loop_k+iy+i]:(half)0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u*64u*(sg%2u);
+        threadgroup const half* lsmb = sb + 2u*64u*(sg/2u);
+        for (uint ik=0; ik<NK/8u; ik++){
+            for (uint i=0;i<4u;i++) simdgroup_load(ma[i], lsma+64u*i, 8u);
+            for (uint i=0;i<2u;i++) simdgroup_load(mb[i], lsmb+64u*i, 8u);
+            for (uint i=0;i<8u;i++) simdgroup_multiply_accumulate(mc[i], mb[i/4u], ma[i%4u], mc[i]);
+            lsma += 8u*64u; lsmb += 4u*64u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint m_sg = 16u*(sg>>1u), n_sg = 32u*(sg&1u);
+    for (uint i=0;i<8u;i++)
+        simdgroup_store(mc[i], &Cs[(m_sg+8u*(i/4u))*64u + n_sg+8u*(i%4u)], 64u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint idx=tl; idx<32u*64u; idx+=128u){
+        uint m=idx/64u, n=idx%64u;
+        if (r1+m<M && r0+n<N) y[(size_t)(r1+m)*N + r0+n] = (half)Cs[m*64u+n];
+    }
+}
+
 kernel void cq4_gemm_dense_f16(
     device const half*  code [[buffer(0)]],
     device const half*  wf16 [[buffer(1)]],

@@ -40,7 +40,7 @@ struct MetalCtx {
     id<MTLComputePipelineState> psoG = nil, psoGmr = nil, psoGmr4 = nil, psoGmrLow = nil, psoGmrLow4 = nil;
     id<MTLComputePipelineState> psoActQ = nil, psoG2i8 = nil;
     id<MTLComputePipelineState> psoTm = nil;
-    id<MTLComputePipelineState> psoGmma = nil, psoGdense = nil;
+    id<MTLComputePipelineState> psoGmma = nil, psoGmmaLow = nil, psoGdense = nil;
     id<MTLComputePipelineState> psoRotW = nil, psoEmbOW = nil, psoRmsAddRms = nil;
     id<MTLComputePipelineState> psoEmbH = nil;
     id<MTLComputePipelineState> psoEmbOm = nil, psoEmbHm = nil;
@@ -89,7 +89,7 @@ struct MetalCtx {
         };
         psoT=pso("cq4_transform"); psoTsimd=pso("cq4_transform_simd"); psoG=pso("cq4_gemv"); psoTbatch=pso("cq4_transform_batch"); psoGmr=pso("cq4_gemv_mr"); psoGmr4=pso("cq4_gemv_mr4");
         psoMega=pso("cq4_transform_gemv"); psoSwiT=pso("cq4_swiglu_transform"); psoCat=pso("cq4_gemv_cat");
-        psoTm=pso("cq4_transform_m"); psoGmma=pso("cq4_gemm_mma");
+        psoTm=pso("cq4_transform_m"); psoGmma=pso("cq4_gemm_mma"); psoGmmaLow=pso("cq_gemm_mma_lowbit");
         psoGdense=pso("cq4_gemm_dense_f16");
         psoGmrLow=pso("cq_gemv_mr_lowbit"); psoGmrLow4=pso("cq_gemv_mr_lowbit4");
         psoActQ=pso("cq_act_quant_i8"); psoG2i8=pso("cq2_gemv_i8");
@@ -1289,8 +1289,9 @@ bool cactus_metal_encode_quant_matmul_m(void* out, const void* lhs, const Cactus
 
     const uint32_t gs=W->group_size, K=W->K, N=W->N, ng=W->num_groups;
     const uint32_t bits=W->bits, pgb=(gs*bits+7u)/8u;
-    const bool fast = ctx().ok && quant_fast_eligible(W);
-    if (!fast || !ctx().psoGmma) return false;
+    const bool fast = ctx().ok && ctx().psoGmma && quant_fast_eligible(W);
+    const bool lowbit = !fast && ctx().psoGmmaLow && quant_lowbit_eligible(W);
+    if (!fast && !lowbit) return false;
     ResW& rw = resident(W);
     if (!rw.ok) return false;
     size_t code_bytes = (size_t)M*ng*gs*sizeof(__fp16);
@@ -1307,12 +1308,13 @@ bool cactus_metal_encode_quant_matmul_m(void* out, const void* lhs, const Cactus
     [g_enc setThreadgroupMemoryLength:gs*sizeof(float) atIndex:0];
     [g_enc dispatchThreadgroups:MTLSizeMake((size_t)ng*M,1,1) threadsPerThreadgroup:MTLSizeMake(gs>1024u?1024u:gs,1,1)];
 
-    [g_enc setComputePipelineState:ctx().psoGmma];
+    [g_enc setComputePipelineState:(lowbit?ctx().psoGmmaLow:ctx().psoGmma)];
     [g_enc setBuffer:g_code_buf_m offset:0 atIndex:0]; [g_enc setBuffer:rw.packed offset:rw.packed_off atIndex:1];
     [g_enc setBuffer:rw.codebook offset:rw.cb_off atIndex:2]; [g_enc setBuffer:rw.norms offset:rw.norms_off atIndex:3];
     setBufAt(out, (size_t)M*N*2, 4);
     [g_enc setBytes:&gs length:4 atIndex:5]; [g_enc setBytes:&ng length:4 atIndex:6];
     [g_enc setBytes:&pgb length:4 atIndex:7]; [g_enc setBytes:&N length:4 atIndex:8]; [g_enc setBytes:&M length:4 atIndex:9];
+    if (lowbit) [g_enc setBytes:&bits length:4 atIndex:10];
     [g_enc dispatchThreadgroups:MTLSizeMake((M+31)/32,(N+63)/64,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
     return true;
 }

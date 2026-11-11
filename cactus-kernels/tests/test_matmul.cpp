@@ -739,6 +739,50 @@ static bool test_cq4_metal_transform_batch_distinct_recip() {
 #endif
 }
 
+static bool check_metal_gemm(uint32_t bits, uint32_t M,
+                                      uint32_t K = 256, uint32_t N = 80, uint32_t gs = 128) {
+#if !CACTUS_HAS_METAL
+    return true;
+#else
+    if (!cactus_metal_available()) return true;
+
+    SyntheticCQ cq(bits, K, N, gs, 900 + bits);
+    CactusQuantMatrix mat = cq.matrix_interleaved();
+
+    std::mt19937 gen(900 + bits);
+    std::uniform_real_distribution<float> dist(-1.f, 1.f);
+    std::vector<__fp16> A(M * K);
+    for (auto& v : A) v = (__fp16)dist(gen);
+
+    std::vector<__fp16> ref(M * N, (__fp16)0), out(M * N, (__fp16)0);
+
+    cactus_quant_matmul(&mat, A.data(), M, ref.data());
+
+    cactus_metal_session_begin();
+    bool ok = cactus_metal_encode_quant_matmul_m(out.data(), A.data(), &mat, M);
+    cactus_metal_session_sync();
+    cactus_metal_session_end();
+    cactus_metal_invalidate_host_wraps();
+
+    float max_ref = 0.f, max_err = 0.f;
+    for (size_t i = 0; i < ref.size(); ++i) max_ref = std::max(max_ref, std::fabs((float)ref[i]));
+    bool match = true;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        float d = std::fabs((float)out[i] - (float)ref[i]);
+        if (!(d <= max_err)) max_err = d;
+        if (!(d <= 1e-2 * max_ref)) match = false;
+    }
+    return ok && match;
+#endif
+}
+
+static bool test_cq_metal_gemm(uint32_t bits) {
+    bool all_ok = true;
+    for (uint32_t M : {32u, 37u, 128u})
+        all_ok = check_metal_gemm(bits, M) && all_ok;
+    return all_ok;
+}
+
 int main() {
     TestRunner runner("Matrix Multiplication");
     runner.run_test("matmul_f16", test_matmul_f16());
@@ -759,6 +803,9 @@ int main() {
         runner.run_test("matmul_cq4_shared_transform", test_cq4_shared_transform_multi_projection());
         runner.run_test("matmul_cq4_metal_distinct_recip", test_cq4_metal_transform_batch_distinct_recip());
     }
+    runner.run_test("matmul_cq2_metal_gemm", test_cq_metal_gemm(2u));
+    runner.run_test("matmul_cq3_metal_gemm", test_cq_metal_gemm(3u));
+    runner.run_test("matmul_cq4_metal_gemm", test_cq_metal_gemm(4u));
     runner.print_benchmarks_header();
     runner.run_bench("benchmarks", run_benchmarks());
     print_mse_report();
